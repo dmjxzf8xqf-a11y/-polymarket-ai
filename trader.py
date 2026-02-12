@@ -7,12 +7,11 @@ GAMMA = "https://gamma-api.polymarket.com"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 
-POLY_HOST = os.getenv("POLY_HOST", "https://clob.polymarket.com")
+POLY_HOST = os.getenv("POLY_HOST", "https://clob.polymarket.com").strip()
 POLY_CHAIN_ID = int(os.getenv("POLY_CHAIN_ID", "137"))
-POLY_PRIVATE_KEY = os.getenv("POLY_PRIVATE_KEY", "")
+POLY_PRIVATE_KEY = os.getenv("POLY_PRIVATE_KEY", "").strip()
 POLY_SIGNATURE_TYPE = int(os.getenv("POLY_SIGNATURE_TYPE", "0"))
-POLY_FUNDER = os.getenv("POLY_FUNDER") or None
-POLY_ADDRESS = os.getenv("POLY_ADDRESS")
+POLY_FUNDER = os.getenv("POLY_FUNDER", "").strip() or None
 
 DRY_RUN = os.getenv("DRY_RUN", "1") == "1"
 MAX_MARKETS = int(os.getenv("MAX_MARKETS", "3"))
@@ -33,7 +32,7 @@ class Trader:
             requests.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                 data={"chat_id": CHAT_ID, "text": text},
-                timeout=10
+                timeout=10,
             )
         except Exception as e:
             print("telegram error:", e)
@@ -49,8 +48,20 @@ class Trader:
         if not POLY_PRIVATE_KEY:
             raise RuntimeError("POLY_PRIVATE_KEY missing")
 
-        if not POLY_ADDRESS:
-            raise RuntimeError("POLY_ADDRESS missing")
+        if not POLY_FUNDER:
+            raise RuntimeError("POLY_FUNDER missing")
+
+        # 🔎 디버그 정보 (값은 안 노출)
+        self.notify(
+            "DEBUG "
+            f"host={POLY_HOST} "
+            f"chain={POLY_CHAIN_ID} "
+            f"sig={POLY_SIGNATURE_TYPE} "
+            f"key_len={len(POLY_PRIVATE_KEY)} "
+            f"key_0x={POLY_PRIVATE_KEY.startswith('0x')} "
+            f"funder_len={len(POLY_FUNDER)} "
+            f"funder_0x={POLY_FUNDER.startswith('0x')}"
+        )
 
         c = ClobClient(
             POLY_HOST,
@@ -58,7 +69,6 @@ class Trader:
             chain_id=POLY_CHAIN_ID,
             signature_type=POLY_SIGNATURE_TYPE,
             funder=POLY_FUNDER,
-            address=POLY_ADDRESS,
         )
 
         # L2 credentials 생성
