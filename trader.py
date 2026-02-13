@@ -1,74 +1,172 @@
 import os
 import time
+import random
 import requests
+from datetime import datetime, timedelta, timezone
+
 from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import OrderArgs, OrderType, OpenOrderParams
+from py_clob_client.order_builder.constants import BUY, SELL
 
 GAMMA = "https://gamma-api.polymarket.com"
+KST = timezone(timedelta(hours=9))
 
+# -----------------------------
+# ENV (Telegram)
+# -----------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 
-POLY_HOST = os.getenv("POLY_HOST", "https://clob.polymarket.com")
+# -----------------------------
+# ENV (Polymarket)
+# -----------------------------
+POLY_HOST = os.getenv("POLY_HOST", "https://clob.polymarket.com").rstrip("/")
 POLY_CHAIN_ID = int(os.getenv("POLY_CHAIN_ID", "137"))
-POLY_PRIVATE_KEY = os.getenv("POLY_PRIVATE_KEY", "")
+POLY_PRIVATE_KEY = (os.getenv("POLY_PRIVATE_KEY") or "").strip()
 POLY_SIGNATURE_TYPE = int(os.getenv("POLY_SIGNATURE_TYPE", "0"))
-POLY_FUNDER = os.getenv("POLY_FUNDER") or None
+POLY_FUNDER = (os.getenv("POLY_FUNDER") or "").strip() or None
 
+# -----------------------------
+# ENV (Mode / risk)
+# -----------------------------
 DRY_RUN = os.getenv("DRY_RUN", "1") == "1"
 
-# ---- 전략 파라미터(환경변수로 조절 가능) ----
-MAX_MARKETS = int(os.getenv("MAX_MARKETS", "20"))           # 평가할 후보 마켓 수(거래량 상위 N개)
-PICK_TOPK = int(os.getenv("PICK_TOPK", "3"))                # 최종 후보 TOP K개 요약 알림
+START_EQUITY_USDC = float(os.getenv("START_EQUITY_USDC", "23"))  # 너는 23 추천
+DAILY_STOP_LOSS_PCT = float(os.getenv("DAILY_STOP_LOSS_PCT", "0.10"))  # -10%
 
-MIN_VOL_24H = float(os.getenv("MIN_VOL_24H", "10000"))      # 24h 거래량 최소
-MIN_PRICE = float(os.getenv("MIN_PRICE", "0.10"))           # YES 중간가 최소(너무 0에 붙은거 제외)
-MAX_PRICE = float(os.getenv("MAX_PRICE", "0.90"))           # YES 중간가 최대(너무 1에 붙은거 제외)
-MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.08"))         # YES 스프레드(ask-bid) 최대
-CENTER_BONUS = float(os.getenv("CENTER_BONUS", "0.5"))      # 0.5 근처 선호 강도(0~1, 클수록 0.5 선호)
+ORDER_USDC = float(os.getenv("ORDER_USDC", "1.0"))  # 1회 베팅액(USDC)
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.02"))  # +2%
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.02"))      # -2%
+MAX_HOLD_MINUTES = int(os.getenv("MAX_HOLD_MINUTES", "120"))   # 2시간
 
-NOTIFY_COOLDOWN_SECONDS = int(os.getenv("NOTIFY_COOLDOWN_SECONDS", "120"))  # 알림 최소 간격(스팸 방지)
+MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "10"))
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "1"))
 
-# ------------------------------------------------------------
+# -----------------------------
+# ENV (market selection)
+# -----------------------------
+MAX_MARKETS = int(os.getenv("MAX_MARKETS", "50"))       # gamma에서 볼 시장 수
+TOPN_EVAL = int(os.getenv("TOPN_EVAL", "15"))           # 오더북까지 평가할 상위 N개
+ROTATE_TOP_N = int(os.getenv("ROTATE_TOP_N", "5"))      # 그 중 최종 선택 후보
+RANDOMIZE = os.getenv("RANDOMIZE", "1") == "1"          # 1: 랜덤, 0: 로테이션
+
+MIN_VOL_24H = float(os.getenv("MIN_VOL_24H", "0"))
+MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.08"))     # 너무 벌어진 시장은 제외
+
+# -----------------------------
+# ENV (notify)
+# -----------------------------
+NOTIFY_COOLDOWN_SECONDS = int(os.getenv("NOTIFY_COOLDOWN_SECONDS", "300"))
+HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "6"))  # tick 몇 번마다 하트비트
+
+DEBUG = os.getenv("DEBUG", "1") == "1"
+
 
 class Trader:
     def __init__(self, state: dict):
         self.state = state
         self.client = None
-        self.last_pick = []
-        self.last_action = None
 
-        self._last_notified_slug = None
-        self._last_notified_ts = 0
+        # daily
+        self.day = self._today_kst()
+        self.realized_pnl = 0.0
+        self.stopped_today = False
+        self.trades_today = 0
 
-    def notify(self, text: str):
-        # 텔레그램 세팅 안되면 콘솔로만
+        # position (in-memory)
+        self.pos = None  # dict with token_id, side, entry_price, size, tp_order_id, opened_ts
+
+        # selection rotation
+        self._tick = 0
+        self._rotate_idx = 0
+
+        # notify
+        self._last_notify_ts = 0
+        self._last_notify_key = None
+
+    # -----------------------------
+    # utilities
+    # -----------------------------
+    def _today_kst(self):
+        return datetime.now(KST).strftime("%Y-%m-%d")
+
+    def _now_ts(self):
+        return int(time.time())
+
+    def notify(self, text: str, key: str = None, cooldown: int = None):
+        if cooldown is None:
+            cooldown = NOTIFY_COOLDOWN_SECONDS
+
+        now = self._now_ts()
+        if key is not None:
+            if self._last_notify_key == key and (now - self._last_notify_ts) < cooldown:
+                return
+            self._last_notify_key = key
+            self._last_notify_ts = now
+
         if not BOT_TOKEN or not CHAT_ID:
             print(text)
             return
 
         try:
-            r = requests.post(
+            requests.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                 data={"chat_id": CHAT_ID, "text": text},
-                timeout=10
+                timeout=10,
             )
-            if r.status_code != 200:
-                print("telegram send failed:", r.status_code, r.text)
         except Exception as e:
             print("telegram error:", e)
 
+    def _debug(self, msg: str):
+        if DEBUG:
+            self.notify(f"DEBUG {msg}", key=None, cooldown=0)
+
     def public_state(self):
         return {
-            "last_pick": self.last_pick,
-            "last_action": self.last_action,
+            "day": self.day,
+            "realized_pnl": round(self.realized_pnl, 4),
+            "stopped_today": self.stopped_today,
+            "trades_today": self.trades_today,
+            "pos": self.pos,
             "dry_run": DRY_RUN,
-            "chain_id": POLY_CHAIN_ID,
-            "host": POLY_HOST
         }
 
+    # -----------------------------
+    # daily stop loss
+    # -----------------------------
+    def _reset_day_if_needed(self):
+        today = self._today_kst()
+        if today != self.day:
+            self.day = today
+            self.realized_pnl = 0.0
+            self.stopped_today = False
+            self.trades_today = 0
+            self.notify(f"🗓️ 일자 변경: {self.day} (손익/횟수 리셋)")
+
+    def _daily_stop_hit(self):
+        limit = -abs(START_EQUITY_USDC * DAILY_STOP_LOSS_PCT)
+        if self.realized_pnl <= limit:
+            if not self.stopped_today:
+                self.stopped_today = True
+                self.notify(
+                    f"🛑 일 손절 발동: PnL={self.realized_pnl:.2f} USDC "
+                    f"(기준 {START_EQUITY_USDC:.2f}의 -{DAILY_STOP_LOSS_PCT*100:.0f}%)"
+                )
+            return True
+        return self.stopped_today
+
+    # -----------------------------
+    # client
+    # -----------------------------
     def _init_client(self):
         if not POLY_PRIVATE_KEY:
             raise RuntimeError("POLY_PRIVATE_KEY missing")
+
+        self._debug(
+            f"host={POLY_HOST} chain={POLY_CHAIN_ID} sig={POLY_SIGNATURE_TYPE} "
+            f"key_len={len(POLY_PRIVATE_KEY)} key_0x={POLY_PRIVATE_KEY.startswith('0x')} "
+            f"funder_len={(len(POLY_FUNDER) if POLY_FUNDER else 0)} funder_0x={(POLY_FUNDER.startswith('0x') if POLY_FUNDER else False)}"
+        )
 
         c = ClobClient(
             POLY_HOST,
@@ -77,41 +175,84 @@ class Trader:
             signature_type=POLY_SIGNATURE_TYPE,
             funder=POLY_FUNDER,
         )
-
-        # L2 creds (주문용) - DRY_RUN이어도 여기서 오류나면 미리 잡히게 유지
         c.set_api_creds(c.create_or_derive_api_creds())
         self.client = c
-
         self.notify("✅ Polymarket CLOB 연결 OK")
 
-    # 1) Gamma에서 마켓 후보 수집 (거래량 큰 것부터)
-    def _pick_candidates_from_gamma(self):
+    # -----------------------------
+    # market data
+    # -----------------------------
+    def _fetch_markets(self):
         r = requests.get(f"{GAMMA}/markets", timeout=25)
         r.raise_for_status()
-        markets = r.json()
+        data = r.json()
+        return data if isinstance(data, list) else []
 
-        candidates = []
-        for m in markets:
+    def _best_levels(self, token_id: str):
+        """
+        returns (bid, bid_size, ask, ask_size, mid, spread, imbalance) or None
+        imbalance: -1~+1 (bid size 우위면 +)
+        """
+        try:
+            ob = self.client.get_order_book(token_id)
+        except Exception:
+            return None
+
+        bids = ob.get("bids") or []
+        asks = ob.get("asks") or []
+        if not bids or not asks:
+            return None
+
+        try:
+            bid = float(bids[0].get("price"))
+            bid_size = float(bids[0].get("size") or bids[0].get("quantity") or 0)
+            ask = float(asks[0].get("price"))
+            ask_size = float(asks[0].get("size") or asks[0].get("quantity") or 0)
+        except Exception:
+            return None
+
+        spread = max(0.0, ask - bid)
+        mid = (ask + bid) / 2.0
+        denom = (bid_size + ask_size)
+        imbalance = (bid_size - ask_size) / denom if denom > 0 else 0.0
+
+        return bid, bid_size, ask, ask_size, mid, spread, imbalance
+
+    # -----------------------------
+    # selection + YES/NO decision
+    # -----------------------------
+    def _candidates(self):
+        markets = self._fetch_markets()
+
+        cands = []
+        for m in markets[:MAX_MARKETS]:
             slug = m.get("slug")
             q = m.get("question") or m.get("title")
-
             token_ids = (
                 m.get("clobTokenIds")
                 or m.get("clob_token_ids")
                 or m.get("tokenIds")
                 or m.get("token_ids")
             )
-
             if not slug or not q or not isinstance(token_ids, list) or len(token_ids) < 2:
                 continue
 
-            vol = m.get("volume24hr") or m.get("volume_24hr") or m.get("volume24h") or m.get("volume") or 0
+            vol = (
+                m.get("volume24hr")
+                or m.get("volume_24hr")
+                or m.get("volume24h")
+                or m.get("volume")
+                or 0
+            )
             try:
                 vol = float(vol)
             except:
                 vol = 0.0
 
-            candidates.append({
+            if vol < MIN_VOL_24H:
+                continue
+
+            cands.append({
                 "slug": slug,
                 "question": q,
                 "yes": str(token_ids[0]),
@@ -119,146 +260,285 @@ class Trader:
                 "vol": vol,
             })
 
-        candidates.sort(key=lambda x: x["vol"], reverse=True)
-        return candidates[:MAX_MARKETS]
+        cands.sort(key=lambda x: x["vol"], reverse=True)
+        return cands
 
-    # 2) CLOB에서 YES 오더북을 보고 bid/ask → mid/spread 계산
-    def _get_yes_quote(self, yes_token_id: str):
-        # py_clob_client 버전에 따라 메소드명이 다를 수 있어서 2단계로 시도
-        bid = None
-        ask = None
+    def _score_and_pick(self, cands):
+        # 오더북까지 볼 상위 N개만
+        eval_list = cands[:max(1, min(len(cands), TOPN_EVAL))]
 
-        # (A) client 메소드 시도
+        scored = []
+        for m in eval_list:
+            y = self._best_levels(m["yes"])
+            n = self._best_levels(m["no"])
+            if not y or not n:
+                continue
+
+            y_bid, y_bsz, y_ask, y_asz, y_mid, y_spread, y_imb = y
+            n_bid, n_bsz, n_ask, n_asz, n_mid, n_spread, n_imb = n
+
+            # 스프레드 필터 (둘 다 너무 벌어지면 제외)
+            if y_spread > MAX_SPREAD and n_spread > MAX_SPREAD:
+                continue
+
+            # YES/NO 결정: imbalance 더 큰 쪽(매수 호가가 더 두꺼운 쪽) 선택
+            if y_imb >= n_imb:
+                side = "YES"
+                token_id = m["yes"]
+                bid, ask, mid, spread, imb = y_bid, y_ask, y_mid, y_spread, y_imb
+            else:
+                side = "NO"
+                token_id = m["no"]
+                bid, ask, mid, spread, imb = n_bid, n_ask, n_mid, n_spread, n_imb
+
+            # 점수: 거래량 / (spread+eps) * (1+|imb|)
+            score = (m["vol"] / max(spread, 1e-6)) * (1.0 + abs(imb))
+
+            scored.append({
+                **m,
+                "score": score,
+                "pick_side": side,
+                "pick_token_id": token_id,
+                "pick_bid": bid,
+                "pick_ask": ask,
+                "pick_mid": mid,
+                "pick_spread": spread,
+                "pick_imb": imb,
+            })
+
+        if not scored:
+            return None
+
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        top = scored[:max(1, min(len(scored), ROTATE_TOP_N))]
+
+        if RANDOMIZE:
+            return random.choice(top)
+
+        self._rotate_idx = (self._rotate_idx + 1) % len(top)
+        return top[self._rotate_idx]
+
+    # -----------------------------
+    # trading helpers
+    # -----------------------------
+    def _place_buy(self, token_id: str, ask_price: float):
+        """
+        BUY size(shares) 계산: ORDER_USDC / ask_price
+        -> 지정가(ask)로 FOK (즉시 전량 체결 아니면 취소)
+        """
+        size = max(0.01, ORDER_USDC / max(ask_price, 1e-6))
+        order = OrderArgs(token_id=token_id, price=float(ask_price), size=float(size), side=BUY)
+        signed = self.client.create_order(order)
+        resp = self.client.post_order(signed, OrderType.FOK)  # 시장가처럼 즉시 체결 목적  [oai_citation:1‡PyPI](https://pypi.org/project/py-clob-client/)
+        return resp, size
+
+    def _place_tp_sell(self, token_id: str, tp_price: float, size: float):
+        """
+        익절 매도: 지정가(tp_price)로 GTC 걸어두기
+        """
+        order = OrderArgs(token_id=token_id, price=float(tp_price), size=float(size), side=SELL)
+        signed = self.client.create_order(order)
+        resp = self.client.post_order(signed, OrderType.GTC)  # 오래 대기  [oai_citation:2‡PyPI](https://pypi.org/project/py-clob-client/)
+        return resp
+
+    def _cancel_order(self, order_id: str):
         try:
-            # 보통: get_order_book(token_id) 형태
-            ob = self.client.get_order_book(yes_token_id)
-            # ob 구조가 다양한데, 일반적으로 bids/asks 리스트를 가정
-            bids = ob.get("bids") or []
-            asks = ob.get("asks") or []
-            if bids:
-                bid = float(bids[0].get("price"))
-            if asks:
-                ask = float(asks[0].get("price"))
+            self.client.cancel(order_id)
         except Exception:
             pass
 
-        # (B) REST fallback 시도 (호스트에 따라 경로가 다를 수 있음)
-        if bid is None or ask is None:
-            try:
-                # 흔한 케이스 중 하나: /book?token_id=
-                rr = requests.get(f"{POLY_HOST.rstrip('/')}/book", params={"token_id": yes_token_id}, timeout=15)
-                rr.raise_for_status()
-                ob = rr.json()
-                bids = ob.get("bids") or []
-                asks = ob.get("asks") or []
-                if bids and bid is None:
-                    bid = float(bids[0].get("price"))
-                if asks and ask is None:
-                    ask = float(asks[0].get("price"))
-            except Exception:
-                pass
+    def _market_exit_sell(self, token_id: str, bid_price: float, size: float):
+        """
+        손절/시간초과 청산: 현재 bid(팔리는 가격)에 FOK로 즉시 청산 시도
+        """
+        # NOTE: 일부 케이스에서 "전량 매도"가 실패하는 이슈가 보고된 적이 있어
+        #       안전하게 99%만 먼저 시도 (필요하면 나중에 남은 분량 재청산)  [oai_citation:3‡GitHub](https://github.com/Polymarket/py-clob-client/issues/265?utm_source=chatgpt.com)
+        size_to_sell = max(0.01, size * 0.99)
 
-        if bid is None or ask is None:
-            return None  # 호가 못 가져옴
+        order = OrderArgs(token_id=token_id, price=float(bid_price), size=float(size_to_sell), side=SELL)
+        signed = self.client.create_order(order)
+        resp = self.client.post_order(signed, OrderType.FOK)
+        return resp, size_to_sell
 
-        mid = (bid + ask) / 2.0
-        spread = max(0.0, ask - bid)
-        return {"bid": bid, "ask": ask, "mid": mid, "spread": spread}
+    # -----------------------------
+    # position lifecycle
+    # -----------------------------
+    def _open_position(self, pick):
+        token_id = pick["pick_token_id"]
+        slug = pick["slug"]
+        side = pick["pick_side"]
+        ask = pick["pick_ask"]
+        bid = pick["pick_bid"]
+        mid = pick["pick_mid"]
 
-    # 3) 필터 + 점수화
-    def _rank(self, candidates):
-        ranked = []
-        for c in candidates:
-            if c["vol"] < MIN_VOL_24H:
-                continue
+        entry_price = float(ask)  # 보수적으로 ask를 엔트리로 잡음(실체결은 더 좋을 수도)
+        tp_price = min(0.99, entry_price * (1.0 + TAKE_PROFIT_PCT))
+        sl_price = max(0.01, entry_price * (1.0 - STOP_LOSS_PCT))
 
-            q = self._get_yes_quote(c["yes"])
-            if not q:
-                continue
+        if DRY_RUN:
+            self.notify(
+                "🧪 DRY_RUN: 진입 시뮬레이션\n"
+                f"- slug: {slug}\n"
+                f"- side: {side}\n"
+                f"- entry(ask): {entry_price:.3f}\n"
+                f"- TP: {tp_price:.3f} (+{TAKE_PROFIT_PCT*100:.1f}%)\n"
+                f"- SL: {sl_price:.3f} (-{STOP_LOSS_PCT*100:.1f}%)\n"
+                f"- hold_max: {MAX_HOLD_MINUTES}m\n"
+                f"- order_usdc: {ORDER_USDC:.2f}\n"
+            )
+            # DRY_RUN에서도 포지션 상태를 만들어서 exit 로직 테스트 가능하게 함
+            size = max(0.01, ORDER_USDC / max(entry_price, 1e-6))
+            self.pos = {
+                "slug": slug,
+                "token_id": token_id,
+                "side": side,
+                "entry_price": entry_price,
+                "size": size,
+                "tp_price": tp_price,
+                "sl_price": sl_price,
+                "tp_order_id": None,
+                "opened_ts": self._now_ts(),
+            }
+            self.trades_today += 1
+            return
 
-            mid = q["mid"]
-            spread = q["spread"]
+        # LIVE
+        buy_resp, size = self._place_buy(token_id, ask_price=ask)
 
-            # 필터
-            if not (MIN_PRICE <= mid <= MAX_PRICE):
-                continue
-            if spread > MAX_SPREAD:
-                continue
+        # TP 주문
+        tp_resp = self._place_tp_sell(token_id, tp_price=tp_price, size=size)
+        tp_order_id = tp_resp.get("orderID") or tp_resp.get("id") or tp_resp.get("order_id")
 
-            # 점수: 거래량(클수록) / (스프레드+작은값) * (0.5 근접 보너스)
-            center = 1.0 - min(1.0, abs(mid - 0.5) / 0.5)  # 0~1, 0.5면 1
-            center_weight = (1.0 - CENTER_BONUS) + (CENTER_BONUS * center)  # CENTER_BONUS가 클수록 0.5 선호
+        self.pos = {
+            "slug": slug,
+            "token_id": token_id,
+            "side": side,
+            "entry_price": entry_price,
+            "size": size,
+            "tp_price": tp_price,
+            "sl_price": sl_price,
+            "tp_order_id": tp_order_id,
+            "opened_ts": self._now_ts(),
+        }
+        self.trades_today += 1
 
-            score = (c["vol"] / (spread + 1e-6)) * center_weight
+        self.notify(
+            "✅ 진입 완료\n"
+            f"- slug: {slug}\n"
+            f"- side: {side}\n"
+            f"- entry(ask): {entry_price:.3f}\n"
+            f"- size(shares): {size:.4f}\n"
+            f"- TP 주문: {tp_price:.3f} (id={tp_order_id})\n"
+            f"- SL 트리거: {sl_price:.3f}\n"
+            f"- hold_max: {MAX_HOLD_MINUTES}m\n"
+        )
 
-            ranked.append({
-                **c,
-                "bid": q["bid"],
-                "ask": q["ask"],
-                "mid": mid,
-                "spread": spread,
-                "score": score,
-            })
+    def _check_exit(self):
+        if not self.pos:
+            return
 
-        ranked.sort(key=lambda x: x["score"], reverse=True)
-        return ranked
+        token_id = self.pos["token_id"]
+        entry = float(self.pos["entry_price"])
+        size = float(self.pos["size"])
+        tp_price = float(self.pos["tp_price"])
+        sl_price = float(self.pos["sl_price"])
+        opened_ts = int(self.pos["opened_ts"])
+        tp_order_id = self.pos.get("tp_order_id")
 
-    def _should_notify(self, top_slug: str):
-        now = time.time()
-        if top_slug != self._last_notified_slug:
-            if now - self._last_notified_ts >= NOTIFY_COOLDOWN_SECONDS:
-                return True
-        # slug가 같아도 너무 오래됐으면 한 번쯤은 보내고 싶으면 여기 조건 추가 가능
-        return False
+        lv = self._best_levels(token_id)
+        if not lv:
+            return
 
+        bid, bid_size, ask, ask_size, mid, spread, imb = lv
+
+        # (A) 익절이 “이미 체결”되었는지 완벽히 확인하려면 체결/포지션 API를 더 붙여야 함.
+        #     여기서는 단순화: mid가 tp 이상이면 TP 주문이 체결될 가능성이 크므로,
+        #     LIVE에서는 TP 주문을 그대로 두고, 손절/시간초과만 적극 청산한다.
+        #     (원하면 다음 단계에서 get_trades()/포지션 조회로 완전 자동화 가능)
+
+        # (B) 손절 트리거
+        stop_hit = (mid <= sl_price)
+
+        # (C) 시간 초과 트리거
+        time_hit = (self._now_ts() - opened_ts) >= (MAX_HOLD_MINUTES * 60)
+
+        if not stop_hit and not time_hit:
+            return
+
+        reason = "STOP_LOSS" if stop_hit else "TIME_EXIT"
+        self.notify(
+            f"⚠️ 청산 트리거: {reason}\n"
+            f"- mid={mid:.3f} (entry={entry:.3f})\n"
+            f"- bid/ask={bid:.3f}/{ask:.3f} spread={spread:.3f}\n"
+        )
+
+        if DRY_RUN:
+            # DRY_RUN에서 실현손익 가정(보수적으로 bid에 청산)
+            exit_price = float(bid)
+            pnl = (exit_price - entry) * size
+            self.realized_pnl += pnl
+            self.notify(f"🧪 DRY_RUN 청산 가정: exit@bid={exit_price:.3f} pnl≈{pnl:.3f} USDC")
+            self.pos = None
+            return
+
+        # LIVE: TP 주문 취소 후 즉시 청산 시도
+        if tp_order_id:
+            self._cancel_order(tp_order_id)
+
+        exit_resp, sold_size = self._market_exit_sell(token_id, bid_price=bid, size=size)
+
+        # 보수적 PnL 추정(실체결은 더 좋을 수도/나쁠 수도)
+        exit_price = float(bid)
+        pnl = (exit_price - entry) * sold_size
+        self.realized_pnl += pnl
+
+        self.notify(
+            "✅ 청산 시도 완료(FOK)\n"
+            f"- exit@bid: {exit_price:.3f}\n"
+            f"- sold_size: {sold_size:.4f}\n"
+            f"- pnl≈ {pnl:.3f} USDC\n"
+            f"- day_pnl≈ {self.realized_pnl:.3f} USDC\n"
+        )
+
+        # 포지션 종료(남은 잔량 처리까지 하려면 추가 로직 필요)
+        self.pos = None
+
+    # -----------------------------
+    # main tick
+    # -----------------------------
     def tick(self):
+        self._tick += 1
+        self._reset_day_if_needed()
+
         if self.client is None:
             self._init_client()
 
-        # 후보 수집
-        candidates = self._pick_candidates_from_gamma()
+        # 하트비트
+        if HEARTBEAT_EVERY > 0 and (self._tick % HEARTBEAT_EVERY == 0):
+            self.notify(
+                f"📡 heartbeat | day={self.day} pnl={self.realized_pnl:.2f} "
+                f"| trades={self.trades_today}/{MAX_TRADES_PER_DAY} | pos={'Y' if self.pos else 'N'} | DRY_RUN={DRY_RUN}"
+            )
 
-        # 점수화
-        ranked = self._rank(candidates)
-
-        self.last_pick = [{"slug": x["slug"], "vol": x["vol"], "mid": round(x["mid"], 4), "spread": round(x["spread"], 4)} for x in ranked[:PICK_TOPK]]
-
-        if not ranked:
-            self.last_action = "no ranked markets (filters too strict)"
-            # 너무 조용하면 상태만 가끔 보내고 싶으면 여기서 notify 넣어도 됨
+        # 일손절
+        if self._daily_stop_hit():
             return
 
-        top = ranked[0]
-        self.last_action = f"picked {top['slug']} mid={top['mid']:.3f} spread={top['spread']:.3f} vol={top['vol']:.0f}"
-
-        # DRY_RUN에서는 주문은 안 내고, “바뀔 때만” 알림
-        if DRY_RUN:
-            if self._should_notify(top["slug"]):
-                msg_lines = [
-                    "🧪 DRY_RUN: 전략(가격/스프레드 필터) 후보 TOP",
-                    f"1) {top['slug']}",
-                    f"- Q: {top['question']}",
-                    f"- vol24h: {top['vol']:.0f}",
-                    f"- YES bid/ask: {top['bid']:.3f}/{top['ask']:.3f}",
-                    f"- mid: {top['mid']:.3f}  spread: {top['spread']:.3f}",
-                    "",
-                    f"(필터) vol>={MIN_VOL_24H} | mid {MIN_PRICE}-{MAX_PRICE} | spread<={MAX_SPREAD}",
-                ]
-                # TOPK 요약도 같이
-                if PICK_TOPK > 1:
-                    msg_lines.append("")
-                    msg_lines.append("📌 TOP 요약:")
-                    for i, x in enumerate(ranked[:PICK_TOPK], start=1):
-                        msg_lines.append(
-                            f"{i}) {x['slug']} | mid={x['mid']:.3f} spread={x['spread']:.3f} vol={x['vol']:.0f}"
-                        )
-
-                self.notify("\n".join(msg_lines))
-                self._last_notified_slug = top["slug"]
-                self._last_notified_ts = time.time()
-
+        # 포지션 있으면 청산 조건만 체크
+        if self.pos:
+            self._check_exit()
             return
 
-        # ✅ 실전 주문 로직은 여기 아래에 붙이면 됨 (지금은 요청이 2번이라 여기까지만)
-        # 예: top['yes'] 토큰에 LIMIT 주문 등
-        # ---------------------------------------------------
+        # 포지션이 없으면 신규 진입 가능 여부 체크
+        if self.trades_today >= MAX_TRADES_PER_DAY:
+            return
+
+        # 후보 선정
+        cands = self._candidates()
+        pick = self._score_and_pick(cands)
+
+        if not pick:
+            return
+
+        # 신규 진입
+        self._open_position(pick)
