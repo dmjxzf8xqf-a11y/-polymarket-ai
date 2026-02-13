@@ -9,7 +9,6 @@ app = Flask(__name__)
 state = {
     "running": False,
     "last_heartbeat": None,
-    "last_event": None,
     "last_error": None,
 }
 
