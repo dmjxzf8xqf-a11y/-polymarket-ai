@@ -15,11 +15,11 @@ state = {
 
 trader = Trader(state)
 
-@app.route("/")
+@app.get("/")
 def home():
     return "Bot Running"
 
-@app.route("/health")
+@app.get("/health")
 def health():
     return jsonify({**state, **trader.public_state()})
 
@@ -39,4 +39,5 @@ def loop():
 if __name__ == "__main__":
     t = threading.Thread(target=loop, daemon=True)
     t.start()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
