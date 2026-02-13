@@ -1,4 +1,5 @@
 import os
+import time
 import requests
 from py_clob_client.client import ClobClient
 
@@ -7,7 +8,7 @@ GAMMA = "https://gamma-api.polymarket.com"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 
-POLY_HOST = os.getenv("POLY_HOST", "https://clob.polymarket.com")
+POLY_HOST = os.getenv("POLY_HOST", "https://clob.polymarket.com").rstrip("/")
 POLY_CHAIN_ID = int(os.getenv("POLY_CHAIN_ID", "137"))
 POLY_PRIVATE_KEY = os.getenv("POLY_PRIVATE_KEY", "")
 POLY_SIGNATURE_TYPE = int(os.getenv("POLY_SIGNATURE_TYPE", "0"))
@@ -17,6 +18,9 @@ DRY_RUN = os.getenv("DRY_RUN", "1") == "1"
 MAX_MARKETS = int(os.getenv("MAX_MARKETS", "3"))
 LOOP_SECONDS = int(os.getenv("LOOP_SECONDS", "20"))
 
+# 스팸 방지용(같은 메시지 반복 전송 막기)
+_last_sent = {"text": None, "ts": 0}
+
 
 class Trader:
     def __init__(self, state: dict):
@@ -25,10 +29,14 @@ class Trader:
         self.last_pick = []
         self.last_action = None
 
-    # -----------------------------
-    # 텔레그램 알림
-    # -----------------------------
     def notify(self, text: str):
+        # 같은 메시지가 너무 자주 반복되면 스킵
+        now = time.time()
+        if _last_sent["text"] == text and (now - _last_sent["ts"]) < 30:
+            return
+        _last_sent["text"] = text
+        _last_sent["ts"] = now
+
         if not BOT_TOKEN or not CHAT_ID:
             print(text)
             return
@@ -36,7 +44,7 @@ class Trader:
             requests.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                 data={"chat_id": CHAT_ID, "text": text},
-                timeout=10
+                timeout=10,
             )
         except Exception as e:
             print("telegram error:", e)
@@ -45,26 +53,23 @@ class Trader:
         return {
             "last_pick": self.last_pick,
             "last_action": self.last_action,
-            "dry_run": DRY_RUN
+            "dry_run": DRY_RUN,
+            "loop_seconds": LOOP_SECONDS,
         }
 
-    # -----------------------------
-    # CLOB 연결
-    # -----------------------------
+    def _debug(self):
+        k = POLY_PRIVATE_KEY or ""
+        f = POLY_FUNDER or ""
+        self.notify(
+            f"DEBUG host={POLY_HOST} | chain={POLY_CHAIN_ID} | sig={POLY_SIGNATURE_TYPE} | "
+            f"key_len={len(k)} key_0x={k.startswith('0x')} | funder_len={len(f)} funder_0x={f.startswith('0x')}"
+        )
+
     def _init_client(self):
         if not POLY_PRIVATE_KEY:
             raise RuntimeError("POLY_PRIVATE_KEY missing")
 
-        # 🔍 디버그 정보 출력
-        self.notify(
-            f"DEBUG host={POLY_HOST} "
-            f"chain={POLY_CHAIN_ID} "
-            f"sig={POLY_SIGNATURE_TYPE} "
-            f"key_len={len(POLY_PRIVATE_KEY)} "
-            f"key_0x={POLY_PRIVATE_KEY.startswith('0x')} "
-            f"funder_len={len(POLY_FUNDER) if POLY_FUNDER else 0} "
-            f"funder_0x={POLY_FUNDER.startswith('0x') if POLY_FUNDER else False}"
-        )
+        self._debug()
 
         c = ClobClient(
             POLY_HOST,
@@ -74,39 +79,32 @@ class Trader:
             funder=POLY_FUNDER,
         )
 
-        # L2 creds 생성
+        # L2 creds 세팅
         c.set_api_creds(c.create_or_derive_api_creds())
-
         self.client = c
         self.notify("✅ Polymarket CLOB 연결 OK")
 
-    # -----------------------------
-    # 시장 선택 (Gamma API 안정 파싱)
-    # -----------------------------
-    def _pick_markets(self):
-        r = requests.get(
-            f"{GAMMA}/markets?active=true&limit=200",
-            timeout=25
-        )
+    def _fetch_markets(self):
+        # Gamma 응답이 list일 때도, dict(data/results/markets)일 때도 처리
+        r = requests.get(f"{GAMMA}/markets", timeout=25)
         r.raise_for_status()
-
         data = r.json()
 
-        # 다양한 응답 구조 대응
+        if isinstance(data, list):
+            return data
         if isinstance(data, dict):
-            markets = (
+            return (
                 data.get("markets")
                 or data.get("data")
                 or data.get("results")
                 or []
             )
-        elif isinstance(data, list):
-            markets = data
-        else:
-            markets = []
+        return []
+
+    def _pick_markets(self):
+        markets = self._fetch_markets()
 
         picks = []
-
         for m in markets:
             slug = m.get("slug")
             q = m.get("question") or m.get("title") or m.get("name")
@@ -119,6 +117,10 @@ class Trader:
                 or []
             )
 
+            active = m.get("active", True)
+            if not active:
+                continue
+
             if not slug or not q or not isinstance(token_ids, list) or len(token_ids) < 2:
                 continue
 
@@ -129,58 +131,51 @@ class Trader:
                 or m.get("volume")
                 or 0
             )
-
             try:
                 vol = float(vol)
-            except Exception:
+            except:
                 vol = 0.0
 
-            picks.append({
-                "slug": slug,
-                "question": q,
-                "yes": str(token_ids[0]),
-                "no": str(token_ids[1]),
-                "vol": vol,
-            })
+            picks.append(
+                {
+                    "slug": slug,
+                    "question": q,
+                    "yes": str(token_ids[0]),
+                    "no": str(token_ids[1]),
+                    "vol": vol,
+                }
+            )
 
         picks.sort(key=lambda x: x["vol"], reverse=True)
         return picks[:MAX_MARKETS]
 
-    # -----------------------------
-    # 루프 실행
-    # -----------------------------
     def tick(self):
         if self.client is None:
             self._init_client()
 
-        picks = self._pick_markets()
-
-        self.notify(
-            f"📡 heartbeat OK | chain={POLY_CHAIN_ID} "
-            f"| dry_run={DRY_RUN} | loop={LOOP_SECONDS}"
-        )
-
-        if not picks:
-            self.notify("DEBUG picks=0 top_slug=none")
-            self.last_action = "no picks"
+        try:
+            picks = self._pick_markets()
+        except Exception as e:
+            self.last_action = "market fetch failed"
+            self.notify(f"❌ market fetch error: {e}")
             return
 
-        self.notify(
-            f"DEBUG picks={len(picks)} top_slug={picks[0]['slug']}"
-        )
+        self.last_pick = [{"slug": p["slug"], "vol": p["vol"]} for p in picks]
 
-        self.last_pick = [
-            {"slug": p["slug"], "vol": p["vol"]}
-            for p in picks
-        ]
+        if not picks:
+            self.last_action = "no picks"
+            self.notify("DEBUG picks=0 top_slug=none")
+            return
 
         target = picks[0]
         self.last_action = f"picked {target['slug']}"
+        self.notify(f"DEBUG picks={len(picks)} top_slug={target['slug']}")
 
+        # DRY_RUN이면 주문 안 냄 (알림만)
         if DRY_RUN:
             self.notify(
-                "🧪 DRY_RUN: 거래 후보 선정됨 (주문은 안 나감)\n"
-                f"{target['slug']}\n"
-                f"{target['question']}"
+                "🧪 DRY_RUN: 거래 후보 선정됨(주문은 안 나감)\n"
+                f"{target['slug']}\n{target['question']}\n"
+                f"vol={target['vol']}"
             )
             return
