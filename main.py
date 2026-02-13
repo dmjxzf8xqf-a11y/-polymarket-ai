@@ -36,7 +36,7 @@ def loop():
         try:
             loop_n += 1
             state["last_heartbeat"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            trader.tick(loop_n=loop_n)
+            trader.tick()
             state["last_error"] = None
         except Exception as e:
             state["last_error"] = str(e)
