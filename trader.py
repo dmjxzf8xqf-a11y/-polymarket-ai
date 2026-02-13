@@ -1,5 +1,4 @@
 import os
-import time
 import requests
 from py_clob_client.client import ClobClient
 
@@ -16,9 +15,7 @@ POLY_FUNDER = os.getenv("POLY_FUNDER") or None
 
 DRY_RUN = os.getenv("DRY_RUN", "1") == "1"
 MAX_MARKETS = int(os.getenv("MAX_MARKETS", "3"))
-
-# 10이면 LOOP_SECONDS=20 기준 약 3분 20초마다 1번
-HEARTBEAT_EVERY = int(os.getenv("HEARTBEAT_EVERY", "10"))
+LOOP_SECONDS = int(os.getenv("LOOP_SECONDS", "20"))
 
 
 class Trader:
@@ -27,9 +24,10 @@ class Trader:
         self.client = None
         self.last_pick = []
         self.last_action = None
-        self.loop_count = 0
-        self._connected_once = False
 
+    # -----------------------------
+    # 텔레그램 알림
+    # -----------------------------
     def notify(self, text: str):
         if not BOT_TOKEN or not CHAT_ID:
             print(text)
@@ -47,19 +45,25 @@ class Trader:
         return {
             "last_pick": self.last_pick,
             "last_action": self.last_action,
-            "dry_run": DRY_RUN,
-            "loop_count": self.loop_count,
+            "dry_run": DRY_RUN
         }
 
+    # -----------------------------
+    # CLOB 연결
+    # -----------------------------
     def _init_client(self):
         if not POLY_PRIVATE_KEY:
             raise RuntimeError("POLY_PRIVATE_KEY missing")
 
-        # 디버그(키 값 노출 X)
+        # 🔍 디버그 정보 출력
         self.notify(
-            f"DEBUG host={POLY_HOST} chain={POLY_CHAIN_ID} sig={POLY_SIGNATURE_TYPE} "
-            f"key_len={len(POLY_PRIVATE_KEY)} key_0x={POLY_PRIVATE_KEY.startswith('0x')} "
-            f"funder_len={(len(POLY_FUNDER) if POLY_FUNDER else 0)} funder_0x={(POLY_FUNDER.startswith('0x') if POLY_FUNDER else False)}"
+            f"DEBUG host={POLY_HOST} "
+            f"chain={POLY_CHAIN_ID} "
+            f"sig={POLY_SIGNATURE_TYPE} "
+            f"key_len={len(POLY_PRIVATE_KEY)} "
+            f"key_0x={POLY_PRIVATE_KEY.startswith('0x')} "
+            f"funder_len={len(POLY_FUNDER) if POLY_FUNDER else 0} "
+            f"funder_0x={POLY_FUNDER.startswith('0x') if POLY_FUNDER else False}"
         )
 
         c = ClobClient(
@@ -70,26 +74,39 @@ class Trader:
             funder=POLY_FUNDER,
         )
 
-        # L2 creds 세팅(주문/서명용)
+        # L2 creds 생성
         c.set_api_creds(c.create_or_derive_api_creds())
 
         self.client = c
-        self._connected_once = True
         self.notify("✅ Polymarket CLOB 연결 OK")
 
+    # -----------------------------
+    # 시장 선택 (Gamma API 안정 파싱)
+    # -----------------------------
     def _pick_markets(self):
-        r = requests.get(f"{GAMMA}/markets", timeout=25)
+        r = requests.get(
+            f"{GAMMA}/markets?active=true&limit=200",
+            timeout=25
+        )
         r.raise_for_status()
 
         data = r.json()
 
-        # gamma 응답이 dict로 오면 markets 키에 들어있는 경우가 많음
+        # 다양한 응답 구조 대응
         if isinstance(data, dict):
-            markets = data.get("markets") or data.get("data") or []
-        else:
+            markets = (
+                data.get("markets")
+                or data.get("data")
+                or data.get("results")
+                or []
+            )
+        elif isinstance(data, list):
             markets = data
+        else:
+            markets = []
 
         picks = []
+
         for m in markets:
             slug = m.get("slug")
             q = m.get("question") or m.get("title") or m.get("name")
@@ -112,6 +129,7 @@ class Trader:
                 or m.get("volume")
                 or 0
             )
+
             try:
                 vol = float(vol)
             except Exception:
@@ -128,39 +146,41 @@ class Trader:
         picks.sort(key=lambda x: x["vol"], reverse=True)
         return picks[:MAX_MARKETS]
 
+    # -----------------------------
+    # 루프 실행
+    # -----------------------------
     def tick(self):
-        self.loop_count += 1
-
-        # 10번에 1번 상태 알림(텔레 스팸 방지)
-        if HEARTBEAT_EVERY > 0 and self.loop_count % HEARTBEAT_EVERY == 0:
-            self.notify(f"📡 heartbeat OK | chain={POLY_CHAIN_ID} | dry_run={DRY_RUN} | loop={self.loop_count}")
-
         if self.client is None:
             self._init_client()
 
         picks = self._pick_markets()
-        self.last_pick = [{"slug": p["slug"], "vol": p["vol"]} for p in picks]
 
-        # picks 디버그(가끔 markets 파싱 실패해서 0개 뜨는지 확인용)
-        if HEARTBEAT_EVERY > 0 and self.loop_count % HEARTBEAT_EVERY == 0:
-            self.notify(f"DEBUG picks={len(picks)} top_slug={(picks[0]['slug'] if picks else 'none')}")
+        self.notify(
+            f"📡 heartbeat OK | chain={POLY_CHAIN_ID} "
+            f"| dry_run={DRY_RUN} | loop={LOOP_SECONDS}"
+        )
 
         if not picks:
+            self.notify("DEBUG picks=0 top_slug=none")
             self.last_action = "no picks"
             return
+
+        self.notify(
+            f"DEBUG picks={len(picks)} top_slug={picks[0]['slug']}"
+        )
+
+        self.last_pick = [
+            {"slug": p["slug"], "vol": p["vol"]}
+            for p in picks
+        ]
 
         target = picks[0]
         self.last_action = f"picked {target['slug']}"
 
-        # DRY_RUN이면 주문 안 나가고 후보만 알림
         if DRY_RUN:
             self.notify(
-                "🧪 DRY_RUN: 거래 후보 선정됨(주문은 안 나감)\n"
-                f"{target['slug']}\n{target['question']}\n"
-                f"vol={target['vol']}"
+                "🧪 DRY_RUN: 거래 후보 선정됨 (주문은 안 나감)\n"
+                f"{target['slug']}\n"
+                f"{target['question']}"
             )
             return
-
-        # (실거래 로직은 여기 아래에 나중에 추가)
-        self.notify("⚠️ DRY_RUN=0인데 실거래 로직이 아직 없음. (안전상 중단)")
-        return
